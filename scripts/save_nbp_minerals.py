@@ -1,37 +1,32 @@
 #!/usr/bin/env python3
-# scripts/save_nbp_rates.py
+# scripts/save_metals.py
 
-from datetime import date, datetime, timedelta
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
-import urllib.request
-import urllib.error
+import requests
 import json
 import os
 import sys
 import tempfile
+import csv
+from io import StringIO
 
 TZ = "Europe/Warsaw"
 
-BASE_OUT_DIR = os.path.join("docs", "exc")
+BASE_OUT_DIR = os.path.join("docs", "metals")
 MAX_FILES_PER_DIR = 999
-
-START_DATE = date(2016, 1, 1)
-CHUNK_DAYS = 93
 
 BACKFILL_MARKER = os.path.join(BASE_OUT_DIR, ".backfill_done")
 LAST_MARKER = os.path.join(BASE_OUT_DIR, ".last")
 
-BASE_TABLE_URL = (
-    "https://api.nbp.pl/api/exchangerates/tables/A/"
-    "{start}/{end}/?format=json"
-)
-SINGLE_DAY_URL = (
-    "https://api.nbp.pl/api/exchangerates/tables/A/"
-    "{date}/?format=json"
-)
+NBP_GOLD_LAST_URL = "https://api.nbp.pl/api/cenyzlota/last/1/?format=json"
+# Stooq CSV endpoint for XAG/PLN (daily). Returns CSV with Date,Open,High,Low,Close,Volume
+STOOQ_XAG_PLN_CSV = "https://stooq.pl/q/d/l/?s=xagpln&i=d"
+
+TROY_OUNCE_GRAMS = 31.1034768  # 1 troy oz = 31.1034768 g
 
 HEADERS = {
-    "User-Agent": "nbp-exchange-rates-fetcher/1.0"
+    "User-Agent": "metals-fetcher/1.0 (+https://github.com/yourrepo)"
 }
 
 def ensure_base_dir():
@@ -63,17 +58,10 @@ def path_for_date(d: date):
     return os.path.join(base, d.strftime("%d_%m_%Y.json"))
 
 def write_json_atomic(path, data):
-    fd, tmp_path = tempfile.mkstemp(
-        suffix=".json",
-        dir=os.path.dirname(path)
-    )
+    fd, tmp_path = tempfile.mkstemp(suffix=".json", dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(json.dumps(
-                data,
-                ensure_ascii=False,
-                separators=(",", ":")
-            ).encode("utf-8"))
+            f.write(json.dumps(data, ensure_ascii=False, separators=(",", ":"), indent=2).encode("utf-8"))
         os.replace(tmp_path, path)
         print("✅ Zapisano:", path)
         return True
@@ -85,20 +73,6 @@ def write_json_atomic(path, data):
             pass
         return False
 
-def http_get(url):
-    req = urllib.request.Request(url, headers=HEADERS)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read()
-            charset = resp.headers.get_content_charset() or "utf-8"
-            return raw.decode(charset)
-    except urllib.error.HTTPError as e:
-        # zwracamy obiekt HTTPError, caller sprawdza kod
-        return e
-    except Exception as e:
-        print("❌ HTTP:", e)
-        return e
-
 def append_last_marker(path):
     try:
         with open(LAST_MARKER, "a", encoding="utf-8") as f:
@@ -107,27 +81,94 @@ def append_last_marker(path):
     except Exception as e:
         print("❌ Błąd zapisu .last:", e)
 
-def process_table_entry(entry):
-    eff_date = entry["effectiveDate"]
-    rates = entry["rates"]
+def http_get_text(url, timeout=30):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        r.raise_for_status()
+        return r.text
+    except requests.HTTPError as e:
+        return e
+    except Exception as e:
+        print("❌ HTTP error:", e)
+        return e
 
-    d = datetime.strptime(eff_date, "%Y-%m-%d").date()
-    out_path = path_for_date(d)
+def fetch_gold_nbp():
+    """Pobiera ostatnią cenę złota z NBP (PLN za 1 g)."""
+    resp = http_get_text(NBP_GOLD_LAST_URL)
+    if isinstance(resp, Exception):
+        return None
+    try:
+        data = json.loads(resp)
+        if not data:
+            return None
+        # data is a list of objects like {"data":"2026-01-27","cena":580.2}
+        item = data[0]
+        d_str = item.get("data") or item.get("Data")  # be safe
+        cena = item.get("cena") or item.get("Cena")
+        if d_str is None or cena is None:
+            return None
+        return {"date": d_str, "gold_pln_per_g": float(cena)}
+    except Exception as e:
+        print("❌ Błąd parsowania JSON (gold):", e)
+        return None
 
+def fetch_silver_stooq():
+    """Pobiera ostatnią cenę srebra z Stooq (XAGPLN) - zwykle w PLN/uncja (troy oz).
+       Konwertuje do PLN/gram."""
+    resp = http_get_text(STOOQ_XAG_PLN_CSV)
+    if isinstance(resp, Exception) or not isinstance(resp, str):
+        print("❌ Błąd pobierania danych srebra ze Stooq:", resp)
+        return None
+    try:
+        buf = StringIO(resp)
+        reader = csv.DictReader(buf)
+        rows = [r for r in reader if any(v.strip() != "" for v in r.values())]
+        if not rows:
+            print("ℹ Stooq zwrócił pusty CSV")
+            return None
+        last = rows[-1]
+        # typowe nagłówki: Date,Open,High,Low,Close,Volume
+        date_str = last.get("Date") or last.get("date") or last.get("DATA")
+        close = last.get("Close") or last.get("close") or last.get("Close.")
+        if close is None or close == '':
+            # czasami separatory i lokalizacja mogą być inne; spróbuj wstępnego czyszczenia:
+            values = list(last.values())
+            if len(values) >= 5:
+                close = values[4]
+        if close is None or close == '':
+            print("❌ Nie udało się znaleźć wartości Close w CSV Stooq")
+            return None
+        # zamień przecinek na kropkę jeżeli potrzeba
+        close = str(close).replace(",", ".")
+        close_val = float(close)
+        silver_pln_per_g = close_val / TROY_OUNCE_GRAMS
+        return {"date": date_str, "silver_pln_per_g": round(silver_pln_per_g, 6), "silver_pln_per_oz": close_val}
+    except Exception as e:
+        print("❌ Błąd parsowania CSV (srebro):", e)
+        return None
+
+def process_and_save():
+    ensure_base_dir()
+    today = datetime.now(ZoneInfo(TZ)).date()
+    out_path = path_for_date(today)
     if os.path.exists(out_path):
         append_last_marker(out_path)
+        print("✔ Plik na dziś już istnieje:", out_path)
         return True
 
+    gold = fetch_gold_nbp()
+    silver = fetch_silver_stooq()
+
     payload = {
-        "date": eff_date,
-        "rates": [
-            {
-                "currency": r["currency"],
-                "code": r["code"],
-                "mid": r["mid"],
-            }
-            for r in rates
-        ],
+        "date": today.isoformat(),
+        "gold_pln_per_g": gold["gold_pln_per_g"] if gold else None,
+        "silver_pln_per_g": silver["silver_pln_per_g"] if silver else None,
+        "silver_pln_per_oz": silver["silver_pln_per_oz"] if silver else None,
+        "sources": {
+            "gold": "NBP api /api/cenyzlota/",
+            "silver": "Stooq xagpln CSV"
+        },
+        "fetched_at": datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
     }
 
     if write_json_atomic(out_path, payload):
@@ -135,89 +176,12 @@ def process_table_entry(entry):
         return True
     return False
 
-def fetch_range(start_d: date, end_d: date):
-    url = BASE_TABLE_URL.format(
-        start=start_d.isoformat(),
-        end=end_d.isoformat()
-    )
-    resp = http_get(url)
-    if isinstance(resp, Exception):
-        return None
-    try:
-        return json.loads(resp)
-    except Exception:
-        return None
-
-def backfill():
-    print("🔁 BACKFILL od", START_DATE.isoformat())
-    cur = START_DATE
-    today = date.today()
-    while cur <= today:
-        chunk_end = min(cur + timedelta(days=CHUNK_DAYS - 1), today)
-        data = fetch_range(cur, chunk_end)
-        if data:
-            for entry in data:
-                process_table_entry(entry)
-        cur = chunk_end + timedelta(days=1)
-    with open(BACKFILL_MARKER, "w") as f:
-        f.write(datetime.utcnow().isoformat())
-    print("✅ BACKFILL ZAKOŃCZONY")
-
-def fetch_recent_and_today(today: date, lookback_days: int = 7):
-    """
-    Najpierw spróbuj pobrać tabelę dla zakresu (today-lookback_days .. today).
-    Jeśli to nic nie zwróci (np. API odpowiedziało 404), spróbuj pojedyncze dni
-    cofając się od today do today-lookback_days (zachowując obsługę 404).
-    Zwraca True jeśli wykonał się poprawnie (nawet jeśli nic nie było do zapisania).
-    """
-    start = today - timedelta(days=lookback_days - 1)
-    print(f"🔎 Próba pobrania zakresu {start.isoformat()} — {today.isoformat()}")
-    data = fetch_range(start, today)
-    if data:
-        print(f"ℹ Znalazłem {len(data)} wpisów w zakresie, przetwarzam...")
-        for entry in data:
-            process_table_entry(entry)
-        return True
-
-    # jeśli zakres nic nie zwrócił, spróbuj po kolei — od dziś wstecz
-    print("ℹ Zakres nic nie zwrócił — próbuję pojedynczych dni wstecz")
-    for i in range(0, lookback_days):
-        d = today - timedelta(days=i)
-        url = SINGLE_DAY_URL.format(date=d.isoformat())
-        resp = http_get(url)
-        if isinstance(resp, urllib.error.HTTPError):
-            # 404 -> brak tabeli w tym dniu (weekend/święto)
-            if resp.code == 404:
-                print(f"ℹ {d.isoformat()}: brak (404)")
-                continue
-            print(f"❌ Błąd HTTP dla {d.isoformat()}: {resp}")
-            return False
-        if isinstance(resp, Exception):
-            print("❌ Błąd przy pobieraniu:", resp)
-            return False
-        try:
-            data = json.loads(resp)
-        except Exception as e:
-            print("❌ Nie udało się zdekodować JSON:", e)
-            return False
-        if data:
-            print(f"ℹ {d.isoformat()}: znaleziono dane, przetwarzam...")
-            for entry in data:
-                process_table_entry(entry)
-            return True
-
-    print(f"ℹ Brak kursów w ostatnich {lookback_days} dniach (weekend/święta).")
-    return True
-
 def main():
-    ensure_base_dir()
-    today = datetime.now(ZoneInfo(TZ)).date()
-    if not os.path.exists(BACKFILL_MARKER):
-        backfill()
-    else:
-        print("✔ Backfill już wykonany")
-    # spróbuj pobrać dane dla ostatnich dni (zwykle złapie też dzisiejsze, jeśli istnieją)
-    fetch_recent_and_today(today, lookback_days=7)
+    ok = process_and_save()
+    if not ok:
+        print("❌ Nie udało się zapisać danych.")
+        sys.exit(1)
+    print("✅ Gotowe.")
     sys.exit(0)
 
 if __name__ == "__main__":
