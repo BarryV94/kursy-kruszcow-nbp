@@ -1,8 +1,6 @@
 name: Update metals prices
 
-on:
-  schedule:
-    - cron: "0 14 * * *"  # 14:00 UTC (dostosuj jeżeli chcesz inny czas)
+on:  # 14:00 UTC (dostosuj jeżeli chcesz inny czas)
   workflow_dispatch:
 
 permissions:
