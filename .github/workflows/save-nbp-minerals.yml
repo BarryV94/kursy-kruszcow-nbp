@@ -1,7 +1,7 @@
 name: Update metals prices
 
-on:  # 14:00 UTC (dostosuj jeżeli chcesz inny czas)
-  workflow_dispatch:
+on:
+  workflow_dispatch: {}
 
 permissions:
   contents: write
