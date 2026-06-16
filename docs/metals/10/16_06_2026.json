@@ -1,0 +1,11 @@
+{
+  "date":"2026-06-16",
+  "gold_pln_per_g":509.74,
+  "silver_pln_per_g":null,
+  "silver_pln_per_oz":null,
+  "sources":{
+    "gold":"NBP",
+    "silver":"Stooq"
+  },
+  "fetched_at":"2026-06-16 18:43:01"
+}
