@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# scripts/save_metals.py
-# Backfill od 2002-01-01 dla złota (NBP) i srebra (Stooq), + codzienne pobranie aktualnego dnia.
 
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -21,24 +19,20 @@ MAX_FILES_PER_DIR = 999
 BACKFILL_MARKER = os.path.join(BASE_OUT_DIR, ".backfill_done")
 LAST_MARKER = os.path.join(BASE_OUT_DIR, ".last")
 
-# NBP gold endpoints
 NBP_GOLD_RANGE_URL = "https://api.nbp.pl/api/cenyzlota/{start}/{end}/?format=json"
 NBP_GOLD_LAST_URL = "https://api.nbp.pl/api/cenyzlota/last/1/?format=json"
 
-# Stooq CSV base (XAGPLN)
 STOOQ_CSV_BASE = "https://stooq.pl/q/d/l/?s=xagpln&i=d"
 
-TROY_OUNCE_GRAMS = 31.1034768  # 1 troy oz = 31.1034768 g
+TROY_OUNCE_GRAMS = 31.1034768
 
 HEADERS = {
-    "User-Agent": "metals-fetcher/1.0 (+https://github.com/yourrepo)"
+    "User-Agent": "metals-fetcher/1.0"
 }
 
-# Backfill start date (2002-01-01)
 BACKFILL_START = date(2002, 1, 1)
-# Chunks
 NBP_CHUNK_DAYS = 365
-STOOQ_CHUNK_DAYS = 365  # Stooq yearly chunks are reasonable
+STOOQ_CHUNK_DAYS = 365
 
 
 def ensure_base_dir():
@@ -46,25 +40,23 @@ def ensure_base_dir():
 
 
 def existing_subdirs():
-    result = []
-    for name in os.listdir(BASE_OUT_DIR):
-        path = os.path.join(BASE_OUT_DIR, name)
-        if os.path.isdir(path) and name.isdigit():
-            result.append(int(name))
-    return sorted(result)
+    return sorted(
+        int(d) for d in os.listdir(BASE_OUT_DIR)
+        if d.isdigit() and os.path.isdir(os.path.join(BASE_OUT_DIR, d))
+    )
 
 
 def pick_target_dir():
     subs = existing_subdirs()
-    if not subs:
-        target = 1
-    else:
-        last = subs[-1]
-        last_path = os.path.join(BASE_OUT_DIR, str(last))
-        count = len([f for f in os.listdir(last_path) if f.endswith(".json")])
-        target = last if count < MAX_FILES_PER_DIR else last + 1
+    target = subs[-1] if subs else 1
     path = os.path.join(BASE_OUT_DIR, str(target))
     os.makedirs(path, exist_ok=True)
+
+    if len([f for f in os.listdir(path) if f.endswith(".json")]) >= MAX_FILES_PER_DIR:
+        target += 1
+        path = os.path.join(BASE_OUT_DIR, str(target))
+        os.makedirs(path, exist_ok=True)
+
     return path
 
 
@@ -74,292 +66,148 @@ def path_for_date(d: date):
 
 
 def write_json_atomic(path, data):
-    fd, tmp_path = tempfile.mkstemp(suffix=".json", dir=os.path.dirname(path))
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(json.dumps(data, ensure_ascii=False, separators=(",", ":"), indent=2).encode("utf-8"))
-        os.replace(tmp_path, path)
-        print("✅ Zapisano:", path)
-        return True
-    except Exception as e:
-        print("❌ Błąd zapisu:", e)
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-        return False
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    print("✅ Zapisano:", path)
+    return True
 
 
 def append_last_marker(path):
-    try:
-        with open(LAST_MARKER, "a", encoding="utf-8") as f:
-            now_str = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
-            f.write(f"{now_str}: {path}\n")
-    except Exception as e:
-        print("❌ Błąd zapisu .last:", e)
+    with open(LAST_MARKER, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now(ZoneInfo(TZ))}: {path}\n")
 
 
-def http_get_text(url, timeout=60) -> Optional[str]:
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout)
-        r.raise_for_status()
-        return r.text
-    except requests.HTTPError as e:
-        return e
-    except Exception as e:
-        print("❌ HTTP error:", e)
-        return e
+def http_get_text(url):
+    r = requests.get(url, headers=HEADERS, timeout=60)
+    r.raise_for_status()
+    return r.text
 
 
-# -----------------------
-# GOLD (NBP) helpers
-# -----------------------
-def fetch_gold_range(start_d: date, end_d: date) -> Optional[List[dict]]:
-    url = NBP_GOLD_RANGE_URL.format(start=start_d.isoformat(), end=end_d.isoformat())
-    resp = http_get_text(url)
-    if isinstance(resp, Exception):
-        print("❌ Błąd HTTP NBP (range):", resp)
-        return None
-    try:
-        return json.loads(resp)  # lista obiektów {Data,Cena} lub podobne
-    except Exception as e:
-        print("❌ Błąd parsowania JSON (NBP range):", e)
-        return None
+# ================= GOLD (NBP) =================
+
+def fetch_gold_range(start_d, end_d):
+    url = NBP_GOLD_RANGE_URL.format(start=start_d, end=end_d)
+    return json.loads(http_get_text(url))
 
 
-def process_gold_entry(item: dict):
-    # item ma pola Data (YYYY-MM-DD) i Cena (PLN per gram)
-    try:
-        d_str = item.get("data") or item.get("Data") or item.get("Data")  # różne nazwy w XML/JSON
-        cena = item.get("cena") or item.get("Cena") or item.get("Cena")
-        if d_str is None or cena is None:
-            return False
-        d = datetime.strptime(d_str, "%Y-%m-%d").date()
-        out_path = path_for_date(d)
-        if os.path.exists(out_path):
-            append_last_marker(out_path)
-            return True
-        payload = {
-            "date": d.isoformat(),
-            "gold_pln_per_g": float(cena),
-            "source": "NBP"
-        }
-        if write_json_atomic(out_path, payload):
-            append_last_marker(out_path)
-            return True
-    except Exception as e:
-        print("❌ Błąd processing gold entry:", e)
-    return False
+def process_gold_entry(item):
+    d = datetime.strptime(item["data"], "%Y-%m-%d").date()
+    out = path_for_date(d)
+    if os.path.exists(out):
+        return
+    write_json_atomic(out, {
+        "date": d.isoformat(),
+        "gold_pln_per_g": float(item["cena"]),
+        "source": "NBP"
+    })
 
 
 def backfill_gold():
-    print("🔁 Backfill złota (NBP) od", BACKFILL_START.isoformat())
     cur = BACKFILL_START
     today = date.today()
     while cur <= today:
-        chunk_end = min(cur + timedelta(days=NBP_CHUNK_DAYS - 1), today)
-        data = fetch_gold_range(cur, chunk_end)
-        if data:
-            for entry in data:
-                process_gold_entry(entry)
+        end = min(cur + timedelta(days=NBP_CHUNK_DAYS - 1), today)
+        for item in fetch_gold_range(cur, end):
+            process_gold_entry(item)
+        cur = end + timedelta(days=1)
+
+
+# ================= SILVER (Stooq) =================
+
+def fetch_stooq_csv(d1, d2):
+    url = f"{STOOQ_CSV_BASE}&d1={d1:%Y%m%d}&d2={d2:%Y%m%d}"
+    return http_get_text(url)
+
+
+def parse_stooq_csv_and_write(csv_text):
+    reader = csv.DictReader(StringIO(csv_text))
+    for row in reader:
+        if not row.get("Date") or not row.get("Close"):
+            continue
+
+        d = datetime.strptime(row["Date"], "%Y-%m-%d").date()
+        out = path_for_date(d)
+
+        try:
+            price_oz = float(row["Close"].replace(",", "."))
+        except:
+            continue
+
+        if os.path.exists(out):
+            with open(out, "r", encoding="utf-8") as f:
+                data = json.load(f)
         else:
-            print(f"ℹ Brak danych dla zakresu {cur} — {chunk_end} (może 404)")
-        cur = chunk_end + timedelta(days=1)
-    print("✅ Backfill złota zakończony")
+            data = {"date": d.isoformat()}
 
+        data["silver_pln_per_oz"] = price_oz
+        data["silver_pln_per_g"] = round(price_oz / TROY_OUNCE_GRAMS, 6)
+        data.setdefault("sources", {})["silver"] = "Stooq"
 
-# -----------------------
-# SILVER (Stooq) helpers
-# -----------------------
-def fetch_stooq_csv(d1: date, d2: date) -> Optional[str]:
-    # Stooq supports d1/d2 in YYYYMMDD format
-    d1s = d1.strftime("%Y%m%d")
-    d2s = d2.strftime("%Y%m%d")
-    url = f"{STOOQ_CSV_BASE}&d1={d1s}&d2={d2s}"
-    resp = http_get_text(url)
-    if isinstance(resp, Exception):
-        print("❌ Błąd HTTP Stooq:", resp)
-        return None
-    return resp
-
-
-def parse_stooq_csv_and_write(csv_text: str):
-    try:
-        buf = StringIO(csv_text)
-        reader = csv.DictReader(buf)
-        rows = [r for r in reader if any((v or "").strip() != "" for v in r.values())]
-        if not rows:
-            return 0
-        written = 0
-        for row in rows:
-            date_str = row.get("Date") or row.get("date")
-            close = row.get("Close") or row.get("close")
-            if not date_str or not close:
-                # spróbuj alternatywnie w wypadku innego formatu nagłówków
-                vals = list(row.values())
-                if len(vals) >= 5:
-                    date_str = vals[0]
-                    close = vals[4]
-            if not date_str or not close:
-                continue
-            close = str(close).replace(",", ".")
-            try:
-                close_val = float(close)
-            except:
-                continue
-            d = datetime.strptime(date_str, "%Y-%m-%d").date()
-            out_path = path_for_date(d)
-            if os.path.exists(out_path):
-                # rozszerz istniejący plik o pole silver (jeśli brak)
-                try:
-                    with open(out_path, "r", encoding="utf-8") as f:
-                        existing = json.load(f)
-                except Exception:
-                    existing = {}
-                changed = False
-                if "silver_pln_per_oz" not in existing:
-                    existing["silver_pln_per_oz"] = close_val
-                    existing["silver_pln_per_g"] = round(close_val / TROY_OUNCE_GRAMS, 6)
-                    existing.setdefault("sources", {})["silver"] = "Stooq"
-                    if write_json_atomic(out_path, existing):
-                        append_last_marker(out_path)
-                        written += 1
-                else:
-                    # już jest silver -> pomiń
-                    pass
-            else:
-                payload = {
-                    "date": d.isoformat(),
-                    "gold_pln_per_g": None,
-                    "silver_pln_per_oz": close_val,
-                    "silver_pln_per_g": round(close_val / TROY_OUNCE_GRAMS, 6),
-                    "sources": {"silver": "Stooq"},
-                    "fetched_at": datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
-                }
-                if write_json_atomic(out_path, payload):
-                    append_last_marker(out_path)
-                    written += 1
-        return written
-    except Exception as e:
-        print("❌ Błąd parsowania CSV Stooq:", e)
-        return 0
+        write_json_atomic(out, data)
 
 
 def backfill_silver():
-    print("🔁 Backfill srebra (Stooq) od", BACKFILL_START.isoformat())
     cur = BACKFILL_START
     today = date.today()
     while cur <= today:
-        chunk_end = min(cur + timedelta(days=STOOQ_CHUNK_DAYS - 1), today)
-        csv_text = fetch_stooq_csv(cur, chunk_end)
-        if csv_text:
-            got = parse_stooq_csv_and_write(csv_text)
-            print(f"ℹ Zapisano {got} rekordów srebra dla zakresu {cur} - {chunk_end}")
-        else:
-            print(f"ℹ Brak CSV Stooq dla {cur} - {chunk_end}")
-        cur = chunk_end + timedelta(days=1)
-    print("✅ Backfill srebra zakończony")
+        end = min(cur + timedelta(days=STOOQ_CHUNK_DAYS - 1), today)
+        parse_stooq_csv_and_write(fetch_stooq_csv(cur, end))
+        cur = end + timedelta(days=1)
 
 
-# -----------------------
-# Daily fetch (today)
-# -----------------------
-def fetch_gold_latest():
-    resp = http_get_text(NBP_GOLD_LAST_URL)
-    if isinstance(resp, Exception):
-        print("❌ Błąd pobierania złota (last):", resp)
-        return None
-    try:
-        data = json.loads(resp)
-        if not data:
-            return None
-        item = data[0]
-        d_str = item.get("data") or item.get("Data")
-        cena = item.get("cena") or item.get("Cena")
-        if not d_str or cena is None:
-            return None
-        return {"date": d_str, "gold_pln_per_g": float(cena)}
-    except Exception as e:
-        print("❌ Błąd parsowania NBP last JSON:", e)
-        return None
+# ================= INDEX.JSON =================
 
-
-def fetch_silver_latest():
-    # pobierz ostatnie 30 dni i wybierz ostatni w CSV
-    csv_text = fetch_stooq_csv(date.today() - timedelta(days=30), date.today())
-    if not csv_text:
-        return None
-    try:
-        buf = StringIO(csv_text)
-        reader = csv.DictReader(buf)
-        rows = [r for r in reader if any((v or "").strip() != "" for v in r.values())]
-        if not rows:
-            return None
-        last = rows[-1]
-        date_str = last.get("Date") or last.get("date")
-        close = last.get("Close") or last.get("close")
-        if not date_str or not close:
-            vals = list(last.values())
-            if len(vals) >= 5:
-                date_str = vals[0]
-                close = vals[4]
-        close = str(close).replace(",", ".")
-        close_val = float(close)
-        return {"date": date_str, "silver_pln_per_oz": close_val, "silver_pln_per_g": round(close_val / TROY_OUNCE_GRAMS, 6)}
-    except Exception as e:
-        print("❌ Błąd parsowania CSV Stooq (latest):", e)
-        return None
-
-
-def process_today_and_save():
-    ensure_base_dir()
-    today = datetime.now(ZoneInfo(TZ)).date()
-    out_path = path_for_date(today)
-    if os.path.exists(out_path):
-        append_last_marker(out_path)
-        print("✔ Dzienny plik już istnieje:", out_path)
-        return True
-
-    gold = fetch_gold_latest()
-    silver = fetch_silver_latest()
-
-    payload = {
-        "date": today.isoformat(),
-        "gold_pln_per_g": gold["gold_pln_per_g"] if gold else None,
-        "silver_pln_per_g": silver["silver_pln_per_g"] if silver else None,
-        "silver_pln_per_oz": silver["silver_pln_per_oz"] if silver else None,
-        "sources": {
-            "gold": "NBP",
-            "silver": "Stooq"
-        },
-        "fetched_at": datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
+def rebuild_metals_index():
+    index = {
+        "metal": "gold",
+        "unit": "PLN_per_gram",
+        "source": "NBP",
+        "updated_at": datetime.utcnow().strftime("%Y-%m-%d"),
+        "days": {}
     }
 
-    if write_json_atomic(out_path, payload):
-        append_last_marker(out_path)
-        return True
-    return False
+    for folder in sorted(os.listdir(BASE_OUT_DIR)):
+        if not folder.isdigit():
+            continue
 
+        folder_path = os.path.join(BASE_OUT_DIR, folder)
+        for file in os.listdir(folder_path):
+            if not file.endswith(".json"):
+                continue
+
+            path = os.path.join(folder_path, file)
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if "date" in data and "gold_pln_per_g" in data:
+                index["days"][data["date"]] = {
+                    "gold_pln_per_g": data["gold_pln_per_g"],
+                    "path": f"{folder}/{file}"
+                }
+
+    index["days"] = dict(sorted(index["days"].items()))
+
+    with open(os.path.join(BASE_OUT_DIR, "index.json"), "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+
+    print(f"📦 index.json: {len(index['days'])} dni")
+
+
+# ================= MAIN =================
 
 def main():
     ensure_base_dir()
-    # Backfill tylko jeśli nie było jeszcze backfilla (marker)
+
     if not os.path.exists(BACKFILL_MARKER):
         backfill_gold()
         backfill_silver()
-        with open(BACKFILL_MARKER, "w", encoding="utf-8") as f:
-            f.write(datetime.utcnow().isoformat())
-        print("✅ Pełny backfill wykonany, utworzono marker.")
-    else:
-        print("✔ Backfill już wykonany - pomijam.")
+        with open(BACKFILL_MARKER, "w") as f:
+            f.write("done")
 
-    # potem zrób codzienny fetch
-    ok = process_today_and_save()
-    if not ok:
-        print("❌ Nie udało się zapisać danych dziennych.")
-        sys.exit(1)
-    print("✅ Gotowe.")
-    sys.exit(0)
+    rebuild_metals_index()
+    print("✅ Gotowe")
 
 
 if __name__ == "__main__":
