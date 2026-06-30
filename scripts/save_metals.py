@@ -9,7 +9,6 @@ import sys
 import tempfile
 import csv
 from io import StringIO
-from typing import Optional, List
 
 TZ = "Europe/Warsaw"
 
@@ -34,6 +33,8 @@ BACKFILL_START = date(2002, 1, 1)
 NBP_CHUNK_DAYS = 365
 STOOQ_CHUNK_DAYS = 365
 
+
+# ================= BASE =================
 
 def ensure_base_dir():
     os.makedirs(BASE_OUT_DIR, exist_ok=True)
@@ -97,6 +98,7 @@ def process_gold_entry(item):
     out = path_for_date(d)
     if os.path.exists(out):
         return
+
     write_json_atomic(out, {
         "date": d.isoformat(),
         "gold_pln_per_g": float(item["cena"]),
@@ -177,13 +179,21 @@ def rebuild_metals_index():
             if not file.endswith(".json"):
                 continue
 
-            path = os.path.join(folder_path, file)
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            file_path = os.path.join(folder_path, file)
 
-            if "date" in data and "gold_pln_per_g" in data:
-                index["days"][data["date"]] = {
-                    "gold_pln_per_g": data["gold_pln_per_g"],
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+
+            date_str = data.get("date")
+            gold = data.get("gold_pln_per_g")
+
+            # ✅ KLUCZOWA POPRAWKA: pomijamy None
+            if date_str and gold is not None:
+                index["days"][date_str] = {
+                    "gold_pln_per_g": gold,
                     "path": f"{folder}/{file}"
                 }
 
@@ -203,7 +213,7 @@ def main():
     if not os.path.exists(BACKFILL_MARKER):
         backfill_gold()
         backfill_silver()
-        with open(BACKFILL_MARKER, "w") as f:
+        with open(BACKFILL_MARKER, "w", encoding="utf-8") as f:
             f.write("done")
 
     rebuild_metals_index()
