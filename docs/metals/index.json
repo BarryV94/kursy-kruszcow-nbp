@@ -2,7 +2,7 @@
   "metal": "gold",
   "unit": "PLN_per_gram",
   "source": "NBP",
-  "updated_at": "2026-08-20",
+  "updated_at": "2026-08-21",
   "days": {
     "2013-01-02": {
       "gold_pln_per_g": 165.83,
