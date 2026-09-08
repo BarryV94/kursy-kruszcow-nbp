@@ -86,6 +86,12 @@ def http_get_text(url):
     return r.text
 
 
+def env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+
+
 # ================= GOLD (NBP) =================
 
 def fetch_gold_range(start_d, end_d):
@@ -109,8 +115,12 @@ def process_gold_entry(item):
 def backfill_gold():
     cur = BACKFILL_START
     today = date.today()
+
+    print(f"🔁 GOLD backfill: {BACKFILL_START} -> {today}")
+
     while cur <= today:
         end = min(cur + timedelta(days=NBP_CHUNK_DAYS - 1), today)
+        print(f"  NBP: {cur} -> {end}")
         for item in fetch_gold_range(cur, end):
             process_gold_entry(item)
         cur = end + timedelta(days=1)
@@ -134,7 +144,7 @@ def parse_stooq_csv_and_write(csv_text):
 
         try:
             price_oz = float(row["Close"].replace(",", "."))
-        except:
+        except Exception:
             continue
 
         if os.path.exists(out):
@@ -153,8 +163,12 @@ def parse_stooq_csv_and_write(csv_text):
 def backfill_silver():
     cur = BACKFILL_START
     today = date.today()
+
+    print(f"🔁 SILVER backfill: {BACKFILL_START} -> {today}")
+
     while cur <= today:
         end = min(cur + timedelta(days=STOOQ_CHUNK_DAYS - 1), today)
+        print(f"  Stooq: {cur} -> {end}")
         parse_stooq_csv_and_write(fetch_stooq_csv(cur, end))
         cur = end + timedelta(days=1)
 
@@ -190,7 +204,6 @@ def rebuild_metals_index():
             date_str = data.get("date")
             gold = data.get("gold_pln_per_g")
 
-            # ✅ KLUCZOWA POPRAWKA: pomijamy None
             if date_str and gold is not None:
                 index["days"][date_str] = {
                     "gold_pln_per_g": gold,
@@ -210,11 +223,22 @@ def rebuild_metals_index():
 def main():
     ensure_base_dir()
 
-    if not os.path.exists(BACKFILL_MARKER):
+    run_backfill = env_flag("RUN_BACKFILL")
+
+    if run_backfill:
+        print("🚨 RĘCZNY BACKFILL WŁĄCZONY")
+        print("Backfill został uruchomiony wyłącznie dlatego, że RUN_BACKFILL=1.")
+
         backfill_gold()
         backfill_silver()
+
         with open(BACKFILL_MARKER, "w", encoding="utf-8") as f:
-            f.write("done")
+            f.write(
+                "manual backfill completed: "
+                + datetime.now(ZoneInfo(TZ)).isoformat()
+            )
+    else:
+        print("ℹ️ Backfill WYŁĄCZONY — normalne działanie bez zmian.")
 
     rebuild_metals_index()
     print("✅ Gotowe")
